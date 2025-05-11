@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { io } from 'socket.io-client';
 
 const Chat = () => {
     const [message, setMessage] = useState('');
@@ -92,105 +93,114 @@ const Chat = () => {
             return;
         }
 
-        const ws = new WebSocket('ws://localhost:3002');
-        setSocket(ws);
+        // Conectar a Socket.IO
+        const socketIo = io(process.env.NODE_ENV === 'production' 
+            ? window.location.origin 
+            : 'http://localhost:3000', {
+                path: '/api/socket',
+                transports: ['websocket'],
+                autoConnect: true,
+                reconnection: true,
+                reconnectionAttempts: 5
+            });
+        
+        setSocket(socketIo);
 
-        ws.onopen = () => {
-            console.log('Conectado al servidor WebSocket');
+        socketIo.on('connect', () => {
+            console.log('Conectado al servidor Socket.IO');
             setIsConnected(true);
-            const joinMessage = { 
+            
+            // Unirse a la sala
+            socketIo.emit('joinRoom', { 
                 type: 'joinRoom', 
                 userName: `${userName}_${sessionId}`,
                 displayName: userName,
                 roomCode 
-            };
-            console.log('Enviando mensaje de unión a sala:', joinMessage);
-            ws.send(JSON.stringify(joinMessage));
-        };
+            });
+            
+            console.log('Enviando mensaje de unión a sala');
+        });
 
-        ws.onmessage = (event) => {
-            console.log('MENSAJE RECIBIDO:', event.data);
-            try {
-                const data = JSON.parse(event.data);
+        // Eventos Socket.IO
+        socketIo.on('message', (data) => {
+            console.log('MENSAJE RECIBIDO:', data);
+            if (data.roomCode === roomCode) {
+                console.log('MENSAJE DE CHAT RECIBIDO:', data);
                 
-                switch (data.type) {
-                    case 'userList':
-                        setConnectedUsers(data.count);
-                        setUserList(data.users);
-                        break;
-                        
-                    case 'typingStatus':
-                        handleTypingStatus(data);
-                        break;
-                        
-                    case 'messageHistory':
-                        handleMessageHistory(data);
-                        break;
-                        
-                    case 'message':
-                        if (data.roomCode === roomCode) {
-                            console.log('MENSAJE DE CHAT RECIBIDO:', data);
-                            
-                            // Agregar el mensaje a la lista de mensajes
-                            if (data.message && typeof data.message === 'string') {
-                                console.log('Agregando mensaje simple:', data.message);
-                                setMessages(prevMessages => [...prevMessages, data.message]);
-                            }
-                            else {
-                                // Es un mensaje completo
-                                const formattedMessage = `${data.sender} [${new Date(data.timestamp).toLocaleTimeString('es-ES', { 
-                                    hour: '2-digit', 
-                                    minute: '2-digit' 
-                                })}]: ${data.message}`;
-                                
-                                console.log('Agregando mensaje formateado:', formattedMessage);
-                                setMessages(prevMessages => [...prevMessages, formattedMessage]);
-                            }
-                            
-                            // Scroll al fondo después de agregar el mensaje
-                            setTimeout(scrollToBottom, 50);
-                        }
-                        break;
-                        
-                    default:
-                        console.log('Tipo de mensaje no manejado:', data.type);
-                        break;
+                // Agregar el mensaje a la lista de mensajes
+                if (data.message && typeof data.message === 'string') {
+                    console.log('Agregando mensaje simple:', data.message);
+                    setMessages(prevMessages => [...prevMessages, data.message]);
                 }
-            } catch (error) {
-                console.error('Error al procesar mensaje:', error);
+                else {
+                    // Es un mensaje completo
+                    const formattedMessage = `${data.sender} [${new Date(data.timestamp).toLocaleTimeString('es-ES', { 
+                        hour: '2-digit', 
+                        minute: '2-digit' 
+                    })}]: ${data.message}`;
+                    
+                    console.log('Agregando mensaje formateado:', formattedMessage);
+                    setMessages(prevMessages => [...prevMessages, formattedMessage]);
+                }
+                
+                // Scroll al fondo después de agregar el mensaje
+                setTimeout(scrollToBottom, 50);
             }
-        };
+        });
 
-        ws.onclose = (event) => {
-            console.log('Desconectado del servidor WebSocket', event.reason);
+        socketIo.on('userList', (data) => {
+            setConnectedUsers(data.count);
+            setUserList(data.users);
+        });
+
+        socketIo.on('typingStatus', (data) => {
+            handleTypingStatus(data);
+        });
+
+        socketIo.on('messageHistory', (data) => {
+            handleMessageHistory(data);
+        });
+
+        socketIo.on('error', (data) => {
+            console.error('Error recibido del servidor:', data.message);
+            alert(`Error: ${data.message}`);
+            
+            // Redirigir al usuario a la página Home si hay un error con la sala
+            if (data.message.includes('sala') && data.message.includes('no existe')) {
+                navigate('/Home');
+            }
+        });
+
+        socketIo.on('disconnect', () => {
+            console.log('Desconectado del servidor Socket.IO');
             setIsConnected(false);
-        };
+        });
 
-        ws.onerror = (error) => {
-            console.error('Error en la conexión WebSocket:', error);
+        socketIo.on('connect_error', (error) => {
+            console.error('Error en la conexión Socket.IO:', error);
             setIsConnected(false);
-        };
+        });
 
+        // Cleanup
         return () => {
-            if (ws.readyState === WebSocket.OPEN) {
+            if (socketIo && socketIo.connected) {
                 if (!hasLeftRoom.current) {
-                    const leaveMessage = { 
+                    socketIo.emit('leaveRoom', { 
                         type: 'leaveRoom', 
                         userName: `${userName}_${sessionId}`,
                         displayName: userName,
                         roomCode 
-                    };
-                    console.log('Enviando mensaje de salida (automático):', leaveMessage);
-                    ws.send(JSON.stringify(leaveMessage));
+                    });
+                    console.log('Enviando mensaje de salida (automático)');
                 }
+                socketIo.disconnect();
             }
-            ws.close();
         };
     }, [userName, roomCode, navigate, sessionId]);
 
     useEffect(() => {
         const handleUserActivity = () => {
-            if (!socket || socket.readyState !== WebSocket.OPEN) return;
+            if (!socket || !socket.connected) return;
             
             if (activityTimeoutRef.current) {
                 clearTimeout(activityTimeoutRef.current);
@@ -200,26 +210,24 @@ const Chat = () => {
             if (!currentUser || currentUser.status === "desconectado") return;
             
             if (currentUser.status === "inactivo") {
-                const statusMessage = {
+                socket.emit('updateStatus', {
                     type: 'updateStatus',
                     userName: `${userName}_${sessionId}`,
                     displayName: userName,
                     roomCode,
                     status: "activo"
-                };
-                socket.send(JSON.stringify(statusMessage));
+                });
             }
             
             activityTimeoutRef.current = setTimeout(() => {
-                if (socket && socket.readyState === WebSocket.OPEN) {
-                    const statusMessage = {
+                if (socket && socket.connected) {
+                    socket.emit('updateStatus', {
                         type: 'updateStatus',
                         userName: `${userName}_${sessionId}`,
                         displayName: userName,
                         roomCode,
                         status: "inactivo"
-                    };
-                    socket.send(JSON.stringify(statusMessage));
+                    });
                 }
                 activityTimeoutRef.current = null;
             }, 120000);
@@ -271,19 +279,18 @@ const Chat = () => {
         const newMessage = e.target.value;
         setMessage(newMessage);
         
-        if (!isConnected || !socket || socket.readyState !== WebSocket.OPEN) return;
+        if (!isConnected || !socket || !socket.connected) return;
         
         // Enviar evento de typing solo cuando hay contenido y no se ha enviado recientemente
         if (newMessage.trim()) {
             // Si no hay temporizador activo, enviar inmediatamente el evento "está escribiendo"
             if (!typingTimeoutRef.current) {
-                const typingMessage = {
+                socket.emit('typing', {
                     type: 'typing',
                     userName: `${userName}_${sessionId}`,
                     displayName: userName,
                     roomCode
-                };
-                socket.send(JSON.stringify(typingMessage));
+                });
             }
             
             // Reiniciar el temporizador cada vez que el usuario escribe
@@ -293,14 +300,13 @@ const Chat = () => {
             
             // Configurar un nuevo temporizador para indicar que ha dejado de escribir
             typingTimeoutRef.current = setTimeout(() => {
-                if (socket && socket.readyState === WebSocket.OPEN) {
-                    const stopTypingMessage = {
+                if (socket && socket.connected) {
+                    socket.emit('stopTyping', {
                         type: 'stopTyping',
                         userName: `${userName}_${sessionId}`,
                         displayName: userName,
                         roomCode
-                    };
-                    socket.send(JSON.stringify(stopTypingMessage));
+                    });
                 }
                 typingTimeoutRef.current = null;
             }, 1000); // Reducir a 1 segundo para mayor precisión
@@ -310,13 +316,12 @@ const Chat = () => {
                 clearTimeout(typingTimeoutRef.current);
                 typingTimeoutRef.current = null;
                 
-                const stopTypingMessage = {
+                socket.emit('stopTyping', {
                     type: 'stopTyping',
                     userName: `${userName}_${sessionId}`,
                     displayName: userName,
                     roomCode
-                };
-                socket.send(JSON.stringify(stopTypingMessage));
+                });
             }
         }
     };
@@ -327,16 +332,15 @@ const Chat = () => {
             return;
         }
         
-        if (message.trim() && socket && socket.readyState === WebSocket.OPEN) {
-            const messageToSend = {
+        if (message.trim() && socket && socket.connected) {
+            socket.emit('sendMessage', {
                 type: 'sendMessage',
                 userName: `${userName}_${sessionId}`,
                 displayName: userName,
                 message: message.trim(),
                 roomCode
-            };
-            console.log('Enviando mensaje al servidor:', messageToSend);
-            socket.send(JSON.stringify(messageToSend));
+            });
+            console.log('Enviando mensaje al servidor');
             setMessage('');
             
             messageInputRef.current?.focus();
@@ -344,23 +348,22 @@ const Chat = () => {
             console.log('No se pudo enviar el mensaje:', {
                 isConnected,
                 hasSocket: !!socket,
-                socketState: socket?.readyState,
+                socketConnected: socket?.connected,
                 message: message.trim()
             });
         }
     };
 
     const handleSalirChat = () => {
-        if (socket && socket.readyState === WebSocket.OPEN) {
-            const leaveMessage = {
+        if (socket && socket.connected) {
+            socket.emit('leaveRoom', {
                 type: 'leaveRoom',
                 userName: `${userName}_${sessionId}`,
                 displayName: userName,
                 roomCode
-            };
-            console.log('Enviando mensaje de salida (explícito):', leaveMessage);
-            socket.send(JSON.stringify(leaveMessage));
-            socket.close();
+            });
+            console.log('Enviando mensaje de salida (explícito)');
+            socket.disconnect();
             
             hasLeftRoom.current = true;
             sessionStorage.setItem(`left_${roomCode}`, 'true');
@@ -375,10 +378,10 @@ const Chat = () => {
     const formatMessage = (msg, index) => {
         // Detectar si es una notificación del sistema o un mensaje de chat
         const isNotification = typeof msg === 'string' && (!msg.includes(':') || msg.includes('ha ingresado a la sala') || msg.includes('ha abandonado la sala'));
-        
+
         if (isNotification) {
             return (
-                <div 
+                <div
                     key={index}
                     className="text-center my-2"
                     style={{
@@ -395,17 +398,17 @@ const Chat = () => {
                 </div>
             );
         }
-        
+
         // Para mensajes de chat, extraer el remitente y contenido
         let senderName = '';
         let messageContent = '';
         let messageTime = '';
-        
+
         try {
             // Extraer información del mensaje con formato "sender [time]: content"
             const senderPart = msg.split('[')[0]?.trim() || '';
             senderName = senderPart;
-            
+
             const parts = msg.match(/\[(.*?)\]:\s*(.*)/);
             if (parts && parts.length >= 3) {
                 messageTime = parts[1];
@@ -418,9 +421,9 @@ const Chat = () => {
             console.error('Error al analizar mensaje:', error);
             messageContent = msg;
         }
-        
+
         const isOwnMessage = senderName === userName;
-        
+
         const messageStyle = {
             marginBottom: '12px',
             padding: '12px 16px',
@@ -437,7 +440,7 @@ const Chat = () => {
             marginRight: isOwnMessage ? '0' : 'auto',
             position: 'relative'
         };
-        
+
         return (
             <div key={index} style={messageStyle}>
                 {!isOwnMessage && senderName && (
@@ -504,17 +507,17 @@ const Chat = () => {
             console.log('Historial de mensajes inválido o para otra sala');
             return;
         }
-        
+
         console.log(`Recibiendo historial de ${data.messages.length} mensajes para la sala ${roomCode}`);
-        
+
         // Actualizamos la lista de mensajes
         const messagesArray = [];
-        
+
         data.messages.forEach(msg => {
             if (msg.type === 'notification') {
                 // Para mensajes de notificación (entradas, salidas)
                 messagesArray.push(msg.content);
-            } 
+            }
             else if (msg.type === 'chat') {
                 try {
                     // Para mensajes de chat
@@ -523,13 +526,13 @@ const Chat = () => {
                         formattedMsg = msg.formattedContent;
                     } else if (msg.content) {
                         // Si no hay formattedContent pero sí hay content, usar el content directamente
-                        const timestamp = new Date(msg.timestamp).toLocaleTimeString('es-ES', { 
-                            hour: '2-digit', 
-                            minute: '2-digit' 
+                        const timestamp = new Date(msg.timestamp).toLocaleTimeString('es-ES', {
+                            hour: '2-digit',
+                            minute: '2-digit'
                         });
                         formattedMsg = `${msg.sender} [${timestamp}]: ${msg.content}`;
                     }
-                    
+
                     if (formattedMsg) {
                         messagesArray.push(formattedMsg);
                     }
@@ -538,13 +541,13 @@ const Chat = () => {
                 }
             }
         });
-        
+
         console.log("Mensajes procesados del historial:", messagesArray);
-        
+
         // Establecer los mensajes en el historial
         if (messagesArray.length > 0) {
             setMessages(messagesArray);
-            
+
             // Scroll al fondo después de cargar el historial
             setTimeout(scrollToBottom, 100);
         }
@@ -552,7 +555,7 @@ const Chat = () => {
 
     return (
         <div className="bg-light" style={{
-            minHeight: '100vh',     
+            minHeight: '100vh',
             padding: '20px',
             display: 'flex',
             justifyContent: 'center',
@@ -560,7 +563,7 @@ const Chat = () => {
             overflowY: 'auto',
             gap: '20px'
         }}>
-            <div style={{ 
+            <div style={{
                 width: 'min(80vw, 600px)',
                 padding: '30px',
                 border: '1px solid #ccc',
@@ -569,7 +572,7 @@ const Chat = () => {
                 boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
                 margin: '20px auto'
             }}>
-                <h1 className="text-center mb-4" style={{ 
+                <h1 className="text-center mb-4" style={{
                 fontSize: '2rem',
                 marginBottom: '1rem',
                 background: 'linear-gradient(45deg, #3a7bd5, #00d2ff)',
@@ -582,7 +585,7 @@ const Chat = () => {
                 justifyContent: 'center',
                 gap: '10px'
                 }}>💬 INTERCOM</h1>
-                
+
                 <div className="d-flex justify-content-between align-items-center mb-3">
                     <div>
                         <p className="mb-0 text-muted">
@@ -592,7 +595,7 @@ const Chat = () => {
                             <span style={{fontWeight: 'bold'}}>Usuario:</span> {userName}
                         </p>
                     </div>
-                    
+
                 <button
                     onClick={handleSalirChat}
                         className="btn btn-danger"
@@ -605,7 +608,7 @@ const Chat = () => {
                         SALIR
                 </button>
                 </div>
-                
+
                 {!isConnected && (
                     <div className="alert alert-warning text-center mb-3" style={{
                         borderRadius: '8px',
@@ -616,7 +619,7 @@ const Chat = () => {
                         No hay conexión con el servidor. Por favor, intenta recargar la página.
                     </div>
                 )}
-                
+
                 <div style={{
                     border: '1px solid #e0e0e0',
                     borderRadius: '12px',
@@ -632,7 +635,7 @@ const Chat = () => {
                     position: 'relative'
                 }}>
                      {messages.length === 0 ? (
-                        <div className="text-center my-auto" style={{ 
+                        <div className="text-center my-auto" style={{
                             color: '#6c757d',
                             fontSize: '16px',
                             fontStyle: 'italic'
@@ -644,9 +647,9 @@ const Chat = () => {
                             {messages.map((msg, index) => formatMessage(msg, index))}
                         </div>
                     )}
-                    
+
                     {typingUsers.length > 0 && (
-                        <div 
+                        <div
                             style={{
                                 padding: '8px 16px',
                                 fontSize: '14px',
@@ -694,14 +697,14 @@ const Chat = () => {
                                     animationDelay: '0.3s'
                                 }}></span>
                             </div>
-                            {typingUsers.length === 1 
-                                ? <span><strong>{typingUsers[0]}</strong> está escribiendo...</span> 
+                            {typingUsers.length === 1
+                                ? <span><strong>{typingUsers[0]}</strong> está escribiendo...</span>
                                 : <span><strong>{typingUsers.length}</strong> personas están escribiendo...</span>}
                         </div>
                     )}
                     <div ref={messagesEndRef} />
                 </div>
-                
+
                 <div className="input-group">
                     <input
                         type="text"
@@ -760,7 +763,7 @@ const Chat = () => {
                 }}>
                     Otros Usuarios <span className="badge bg-primary">{userList.filter(user => user.name !== userName).length}</span>
                 </h3>
-                
+
                 <div style={{
                     overflowY: 'auto',
                     maxHeight: '400px',
@@ -791,10 +794,10 @@ const Chat = () => {
                                         Activos
                                     </li>
                                 )}
-                                
+
                                 {userList.filter(user => user.name !== userName && user.connected && user.status === "activo").map((user, index) => (
-                                    <li 
-                                        key={`active-${index}`} 
+                                    <li
+                                        key={`active-${index}`}
                                         style={{
                                             padding: '10px',
                                             borderBottom: '1px solid #eee',
@@ -844,7 +847,7 @@ const Chat = () => {
                                         </div>
                                     </li>
                                 ))}
-                                
+
                                 {/* Mostrar usuarios inactivos */}
                                 {userList.filter(user => user.name !== userName && user.connected && user.status === "inactivo").length > 0 && (
                                     <li key="inactiveHeader" style={{
@@ -860,10 +863,10 @@ const Chat = () => {
                                         Inactivos
                                     </li>
                                 )}
-                                
+
                                 {userList.filter(user => user.name !== userName && user.connected && user.status === "inactivo").map((user, index) => (
-                                    <li 
-                                        key={`inactive-${index}`} 
+                                    <li
+                                        key={`inactive-${index}`}
                                         style={{
                                             padding: '10px',
                                             borderBottom: '1px solid #eee',
@@ -903,7 +906,7 @@ const Chat = () => {
                                         </div>
                                     </li>
                                 ))}
-                                
+
                                 {/* Mostrar usuarios desconectados */}
                                 {userList.filter(user => user.name !== userName && (!user.connected || user.status === "desconectado")).length > 0 && (
                                     <li key="disconnectedHeader" style={{
@@ -919,10 +922,10 @@ const Chat = () => {
                                         Desconectados
                                     </li>
                                 )}
-                                
+
                                 {userList.filter(user => user.name !== userName && (!user.connected || user.status === "desconectado")).map((user, index) => (
-                                    <li 
-                                        key={`disconnected-${index}`} 
+                                    <li
+                                        key={`disconnected-${index}`}
                                         style={{
                                             padding: '8px',
                                             display: 'flex',
